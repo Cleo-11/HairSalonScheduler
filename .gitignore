@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.next/
+out/
+.env
+.env.local
+.vercel
+*.log
+*.tsbuildinfo
+coverage/
+e2e/screenshots/

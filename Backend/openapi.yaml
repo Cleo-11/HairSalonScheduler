@@ -1,0 +1,1652 @@
+openapi: 3.1.0
+info:
+  title: Salon Queue API
+  version: 0.1.0
+  description: |
+    Backend for the salon walk-in queue MVP: customers join a live queue at a nearby salon,
+    pick services and a stylist, and see an honest wait estimate; the front desk runs the
+    queue from a dashboard.
+
+    **Conventions**
+    - All times are ISO 8601 UTC instants. Salon-local wall times (opening hours) are `HH:MM`
+      in the salon's `timezone`.
+    - Money is in paise (₹1 = 100 paise).
+    - Errors always have the shape `{ "error": { "code", "message", "details" } }`. Switch on
+      `code`, show `message`.
+    - Wait estimates come with a range (`wait_range_minutes`); show the range, not just one number.
+    - Live updates: open `GET /v1/salons/{slug}/events` (Server-Sent Events). Each `queue`
+      event means "something changed": refetch the customer's entry or the dashboard.
+      Events carry no personal data, so a plain `EventSource` works without auth.
+
+    **Auth**
+    - Customers: `POST /v1/auth/otp/request` then `/v1/auth/otp/verify` returns a bearer token
+      (typ `customer`, 30 days). New customers must `PATCH /v1/me` with a name before joining.
+    - Staff: `POST /v1/staff/auth/login` returns a bearer token (typ `staff`, 12 hours). Every
+      `/v1/dashboard/{slug}` route checks the caller's role *in that salon*:
+      owner > receptionist > stylist. Stylists can only act on their own customers.
+servers:
+  - url: http://localhost:3000
+    description: Local development
+tags:
+  - name: Auth
+  - name: Salons
+    description: Public salon discovery, menu and stylist choice
+  - name: Queue
+    description: The signed-in customer's place in a queue
+  - name: Dashboard
+    description: Front-desk live queue and stylist board
+  - name: Dashboard settings
+    description: Owner-level configuration
+  - name: System
+
+components:
+  securitySchemes:
+    customerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token from /v1/auth/otp/verify
+    staffAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token from /v1/staff/auth/login
+
+  parameters:
+    Slug:
+      name: slug
+      in: path
+      required: true
+      schema: { type: string, example: demo-salon-bandra }
+    EntryId:
+      name: entryId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    StylistId:
+      name: stylistId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ServiceId:
+      name: serviceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: "Validation failed. Codes: VALIDATION_ERROR and endpoint-specific codes."
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing, invalid or wrong-type token (UNAUTHORIZED)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Not a member of this salon, or role not allowed (FORBIDDEN)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: The queue is not in a state that allows this (see `code`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooMany:
+      description: Rate limited (RATE_LIMITED or an OTP-specific code)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DashboardEntry:
+      description: The entry after the change
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [entry]
+            properties:
+              entry: { $ref: '#/components/schemas/DashboardQueueEntry' }
+
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, details]
+          properties:
+            code: { type: string, examples: [OTP_INVALID, ALREADY_IN_QUEUE, SALON_CLOSED] }
+            message: { type: string, description: Human-readable, safe to show }
+            details: { type: [object, 'null'] }
+
+    Timestamp: { type: string, format: date-time }
+    NullableTimestamp: { type: [string, 'null'], format: date-time }
+    HHMM: { type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', example: '10:00' }
+    Role: { type: string, enum: [owner, receptionist, stylist] }
+    StylistStatus:
+      type: string
+      enum: [available, busy, break, 'off']
+      description: "`off` = not working; nobody is estimated or assigned to them."
+    EntryStatus:
+      type: string
+      enum: [waiting, called, in_service, done, no_show, left, cancelled]
+      description: |
+        waiting → called (desk summoned them) → in_service → done.
+        Ends early with left (customer), no_show or cancelled (desk).
+    WaitRange:
+      type: object
+      additionalProperties: false
+      required: [low, high]
+      properties:
+        low: { type: integer, minimum: 0 }
+        high: { type: integer, minimum: 0 }
+
+    Customer:
+      type: object
+      additionalProperties: false
+      required: [id, phone, name, needs_name]
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string, example: '+919876543210' }
+        name: { type: [string, 'null'] }
+        needs_name: { type: boolean, description: true until the customer has given a name }
+
+    StaffProfile:
+      type: object
+      required: [staff, memberships]
+      properties:
+        staff:
+          type: object
+          additionalProperties: false
+          required: [id, email, name]
+          properties:
+            id: { type: string, format: uuid }
+            email: { type: string }
+            name: { type: string }
+        memberships:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [salon_id, salon_slug, salon_name, role, stylist_id]
+            properties:
+              salon_id: { type: string, format: uuid }
+              salon_slug: { type: string }
+              salon_name: { type: string }
+              role: { $ref: '#/components/schemas/Role' }
+              stylist_id: { type: [string, 'null'], format: uuid, description: Set when this login is a stylist }
+
+    OpenStatus:
+      type: object
+      required: [is_open_now, closes_at, today_closes_at, next_open_at, is_holiday, joins_paused, e_walk_in_enabled, accepting_joins]
+      properties:
+        is_open_now: { type: boolean }
+        closes_at: { $ref: '#/components/schemas/NullableTimestamp', description: End of the current open interval }
+        today_closes_at: { $ref: '#/components/schemas/NullableTimestamp', description: Final closing time today }
+        next_open_at: { $ref: '#/components/schemas/NullableTimestamp', description: Set when closed now }
+        is_holiday: { type: boolean }
+        joins_paused: { type: boolean, description: The desk has stopped new joins }
+        e_walk_in_enabled: { type: boolean, description: "The desk's E Walk-In switch. false = joins with e_walk_in: true are refused (E_WALK_IN_DISABLED)" }
+        accepting_joins: { type: boolean, description: is_open_now and not joins_paused }
+
+    SalonSummary:
+      type: object
+      additionalProperties: false
+      required: [id, slug, name, address, lat, lng, distance_m, within_join_radius, is_open_now, accepting_joins, e_walk_in_enabled, next_open_at]
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        address: { type: string }
+        lat: { type: number }
+        lng: { type: number }
+        distance_m: { type: [integer, 'null'], description: Only when lat/lng were sent }
+        within_join_radius: { type: [boolean, 'null'], description: "false = the app will refuse the join (TOO_FAR_FROM_SALON)" }
+        is_open_now: { type: boolean }
+        accepting_joins: { type: boolean }
+        e_walk_in_enabled: { type: boolean }
+        next_open_at: { $ref: '#/components/schemas/NullableTimestamp' }
+
+    HoursInterval:
+      type: object
+      additionalProperties: false
+      required: [weekday, opens, closes]
+      properties:
+        weekday: { type: integer, minimum: 0, maximum: 6, description: 0 = Sunday }
+        opens: { $ref: '#/components/schemas/HHMM' }
+        closes: { $ref: '#/components/schemas/HHMM' }
+
+    SalonDetail:
+      allOf:
+        - $ref: '#/components/schemas/OpenStatus'
+        - type: object
+          required: [id, slug, name, address, phone, lat, lng, timezone, join_radius_m, noshow_grace_minutes, hours]
+          properties:
+            id: { type: string, format: uuid }
+            slug: { type: string }
+            name: { type: string }
+            address: { type: string }
+            phone: { type: [string, 'null'] }
+            lat: { type: number }
+            lng: { type: number }
+            timezone: { type: string, example: Asia/Kolkata }
+            join_radius_m: { type: [integer, 'null'] }
+            noshow_grace_minutes: { type: integer }
+            hours: { type: array, items: { $ref: '#/components/schemas/HoursInterval' } }
+      unevaluatedProperties: false
+
+    Service:
+      type: object
+      additionalProperties: false
+      required: [id, name, description, price_paise, default_minutes]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        price_paise: { type: integer, example: 30000 }
+        default_minutes: { type: integer, description: Typical duration; each stylist may take more or less }
+
+    StylistCard:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, status, break_until, available, e_walk_in_enabled, queue_length, next_free_at, minutes, est_start_at, wait_minutes, wait_range_minutes]
+      properties:
+        id: { type: string, format: uuid }
+        display_name: { type: string }
+        status: { $ref: '#/components/schemas/StylistStatus' }
+        break_until: { $ref: '#/components/schemas/NullableTimestamp' }
+        available: { type: boolean, description: false when off; do not let the customer pick them }
+        e_walk_in_enabled: { type: boolean, description: false = this stylist is not taking E Walk-In clients (joining them by name is refused with STYLIST_NOT_E_WALK_IN) }
+        queue_length: { type: integer, description: People in this stylist's line, including the one in the chair }
+        next_free_at: { $ref: '#/components/schemas/NullableTimestamp' }
+        minutes: { type: [integer, 'null'], description: This stylist's time for the chosen services }
+        est_start_at: { $ref: '#/components/schemas/NullableTimestamp' }
+        wait_minutes: { type: [integer, 'null'] }
+        wait_range_minutes:
+          oneOf: [{ $ref: '#/components/schemas/WaitRange' }, { type: 'null' }]
+
+    AnyAvailable:
+      type: object
+      additionalProperties: false
+      required: [stylist_id, est_start_at, wait_minutes, wait_range_minutes, minutes]
+      description: What "Any available" would give right now (the stylist with the earliest start)
+      properties:
+        stylist_id: { type: string, format: uuid }
+        est_start_at: { $ref: '#/components/schemas/Timestamp' }
+        wait_minutes: { type: integer }
+        wait_range_minutes: { $ref: '#/components/schemas/WaitRange' }
+        minutes: { type: integer }
+
+    EWalkInStatus:
+      type: object
+      additionalProperties: false
+      required: [enabled, free_now, all_busy, next_slot]
+      description: |
+        What a customer joining E Walk-In right now would get, for the chosen services. Only stylists
+        taking part in E Walk-In are counted.
+      properties:
+        enabled: { type: boolean, description: The salon's E Walk-In switch }
+        free_now: { type: integer, description: Stylists who could start the customer immediately }
+        all_busy:
+          type: [boolean, 'null']
+          description: true when nobody can start right now, so show a countdown to `next_slot`. null until services are chosen or when nobody is available.
+        next_slot:
+          description: The soonest slot. With a random pick, the customer gets one of the stylists free at this time.
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [est_start_at, wait_minutes, wait_range_minutes, people_ahead]
+              properties:
+                est_start_at: { $ref: '#/components/schemas/Timestamp' }
+                wait_minutes: { type: integer }
+                wait_range_minutes: { $ref: '#/components/schemas/WaitRange' }
+                people_ahead: { type: integer, description: People in that stylist's line, including the one in the chair }
+            - type: 'null'
+
+    EntryServiceLine:
+      type: object
+      additionalProperties: false
+      required: [service_id, name, minutes, price_paise]
+      properties:
+        service_id: { type: string, format: uuid }
+        name: { type: string }
+        minutes: { type: integer }
+        price_paise: { type: integer, description: Price agreed at join time }
+
+    QueueEntryBase:
+      type: object
+      required: [id, status, stylist, requested_stylist_id, any_stylist, e_walk_in, services, total_minutes, total_price_paise,
+                 people_ahead, est_start_at, est_end_at, wait_minutes, wait_range_minutes, stylist_available,
+                 joined_at, called_at, started_at]
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/EntryStatus' }
+        stylist:
+          type: object
+          additionalProperties: false
+          required: [id, display_name]
+          properties:
+            id: { type: string, format: uuid }
+            display_name: { type: string }
+        requested_stylist_id: { type: [string, 'null'], format: uuid, description: null = "any available" }
+        any_stylist: { type: boolean }
+        e_walk_in: { type: boolean, description: Joined through E Walk-In (random stylist when any_stylist, otherwise the requested one) }
+        services: { type: array, items: { $ref: '#/components/schemas/EntryServiceLine' } }
+        total_minutes: { type: integer, description: Services plus any extension }
+        total_price_paise: { type: integer }
+        people_ahead:
+          type: [integer, 'null']
+          description: People before this customer in the stylist's line (0 = next). null once the entry has ended.
+        est_start_at: { $ref: '#/components/schemas/NullableTimestamp' }
+        est_end_at: { $ref: '#/components/schemas/NullableTimestamp' }
+        wait_minutes: { type: [integer, 'null'] }
+        wait_range_minutes:
+          oneOf: [{ $ref: '#/components/schemas/WaitRange' }, { type: 'null' }]
+        stylist_available:
+          type: boolean
+          description: false when the assigned stylist went off; the desk must reassign (no estimate until then)
+        joined_at: { $ref: '#/components/schemas/Timestamp' }
+        called_at: { $ref: '#/components/schemas/NullableTimestamp' }
+        started_at: { $ref: '#/components/schemas/NullableTimestamp' }
+
+    CustomerQueueEntry:
+      allOf:
+        - $ref: '#/components/schemas/QueueEntryBase'
+        - type: object
+          required: [salon, noshow_grace_minutes]
+          properties:
+            salon:
+              type: object
+              additionalProperties: false
+              required: [id, slug, name]
+              properties:
+                id: { type: string, format: uuid }
+                slug: { type: string }
+                name: { type: string }
+            noshow_grace_minutes: { type: integer, description: Minutes to reach the chair once called }
+      unevaluatedProperties: false
+
+    DashboardQueueEntry:
+      allOf:
+        - $ref: '#/components/schemas/QueueEntryBase'
+        - type: object
+          required: [customer_id, display_name, phone_masked, source, position, skip_count, extra_minutes]
+          properties:
+            customer_id: { type: [string, 'null'], format: uuid }
+            display_name: { type: string }
+            phone_masked: { type: [string, 'null'], example: '+91 ••••• •3210' }
+            source: { type: string, enum: [app, walk_in] }
+            position: { type: integer, description: Order within the stylist's line }
+            skip_count: { type: integer }
+            extra_minutes: { type: integer }
+      unevaluatedProperties: false
+
+    StylistBoardItem:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, status, break_until, current_entry_id, queue_length, next_free_at, e_walk_in_enabled, service_ids]
+      properties:
+        id: { type: string, format: uuid }
+        display_name: { type: string }
+        status: { $ref: '#/components/schemas/StylistStatus' }
+        break_until: { $ref: '#/components/schemas/NullableTimestamp' }
+        current_entry_id: { type: [string, 'null'], format: uuid }
+        queue_length: { type: integer }
+        next_free_at: { $ref: '#/components/schemas/NullableTimestamp' }
+        e_walk_in_enabled: { type: boolean, description: In the E Walk-In random pool and requestable by name }
+        service_ids: { type: array, items: { type: string, format: uuid } }
+
+    Dashboard:
+      type: object
+      additionalProperties: false
+      required: [salon, stylists, entries, generated_at, me]
+      properties:
+        salon:
+          allOf:
+            - $ref: '#/components/schemas/OpenStatus'
+            - type: object
+              required: [id, slug, name]
+              properties:
+                id: { type: string, format: uuid }
+                slug: { type: string }
+                name: { type: string }
+          unevaluatedProperties: false
+        stylists: { type: array, items: { $ref: '#/components/schemas/StylistBoardItem' } }
+        entries:
+          type: array
+          description: Active entries across all stylists, in the order they are expected to be served
+          items: { $ref: '#/components/schemas/DashboardQueueEntry' }
+        generated_at: { $ref: '#/components/schemas/Timestamp' }
+        me:
+          type: object
+          additionalProperties: false
+          required: [role, stylist_id]
+          properties:
+            role: { $ref: '#/components/schemas/Role' }
+            stylist_id: { type: [string, 'null'], format: uuid }
+
+    PublicSnapshot:
+      description: Payload of each `queue` SSE event. Contains no personal data.
+      allOf:
+        - $ref: '#/components/schemas/OpenStatus'
+        - type: object
+          required: [salon_id, at, stylists]
+          properties:
+            salon_id: { type: string, format: uuid }
+            at: { $ref: '#/components/schemas/Timestamp' }
+            stylists:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [id, display_name, status, queue_length, next_free_at]
+                properties:
+                  id: { type: string, format: uuid }
+                  display_name: { type: string }
+                  status: { $ref: '#/components/schemas/StylistStatus' }
+                  queue_length: { type: integer }
+                  next_free_at: { $ref: '#/components/schemas/NullableTimestamp' }
+      unevaluatedProperties: false
+
+    StylistAdmin:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, status, break_until, sort_order, is_active, e_walk_in_enabled, staff_member_id, services]
+      properties:
+        id: { type: string, format: uuid }
+        display_name: { type: string }
+        status: { $ref: '#/components/schemas/StylistStatus' }
+        break_until: { $ref: '#/components/schemas/NullableTimestamp' }
+        sort_order: { type: integer }
+        is_active: { type: boolean }
+        e_walk_in_enabled: { type: boolean }
+        staff_member_id: { type: [string, 'null'], format: uuid }
+        services:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [service_id, name, default_minutes, custom_minutes, effective_minutes]
+            properties:
+              service_id: { type: string, format: uuid }
+              name: { type: string }
+              default_minutes: { type: integer }
+              custom_minutes: { type: [integer, 'null'], description: This stylist's own duration, if set }
+              effective_minutes: { type: integer }
+
+    ServiceAdmin:
+      type: object
+      additionalProperties: false
+      required: [id, name, description, price_paise, default_minutes, sort_order, is_active]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        price_paise: { type: integer }
+        default_minutes: { type: integer }
+        sort_order: { type: integer }
+        is_active: { type: boolean }
+        stylist_ids: { type: array, items: { type: string, format: uuid } }
+
+    SalonSettings:
+      type: object
+      additionalProperties: false
+      required: [id, slug, name, address, phone, lat, lng, timezone, buffer_minutes, noshow_grace_minutes,
+                 noshow_policy, turn_alert_minutes, join_radius_m, joins_paused, e_walk_in_enabled, is_active]
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        name: { type: string }
+        address: { type: string }
+        phone: { type: [string, 'null'] }
+        lat: { type: number }
+        lng: { type: number }
+        timezone: { type: string }
+        buffer_minutes: { type: integer, description: Gap between customers }
+        noshow_grace_minutes: { type: integer }
+        noshow_policy:
+          type: string
+          enum: [requeue_once, mark_no_show]
+          description: What happens when a called customer misses the grace period
+        turn_alert_minutes: { type: integer, description: Send the WhatsApp "turn is near" alert this many minutes before; 0 disables }
+        join_radius_m: { type: [integer, 'null'], description: Max distance for app joins; null disables the check }
+        joins_paused: { type: boolean }
+        e_walk_in_enabled: { type: boolean, description: Salon-wide E Walk-In switch }
+        is_active: { type: boolean }
+
+    SettingsPatch:
+      type: object
+      additionalProperties: false
+      description: Receptionists may only change `joins_paused` and `e_walk_in_enabled`.
+      properties:
+        name: { type: string }
+        address: { type: string }
+        phone: { type: [string, 'null'] }
+        lat: { type: number }
+        lng: { type: number }
+        buffer_minutes: { type: integer, minimum: 0, maximum: 60 }
+        noshow_grace_minutes: { type: integer, minimum: 1, maximum: 60 }
+        noshow_policy: { type: string, enum: [requeue_once, mark_no_show] }
+        turn_alert_minutes: { type: integer, minimum: 0, maximum: 120 }
+        join_radius_m: { type: [integer, 'null'], minimum: 50, maximum: 100000 }
+        joins_paused: { type: boolean }
+        e_walk_in_enabled: { type: boolean }
+
+    AccuracyReport:
+      type: object
+      additionalProperties: false
+      required: [date, timezone, summary, by_stylist]
+      properties:
+        date: { type: string, format: date }
+        timezone: { type: string }
+        summary:
+          type: object
+          additionalProperties: false
+          required: [joined, served, no_shows, left_queue, via_app, via_e_walk_in, mean_abs_error_minutes, mean_signed_error_minutes,
+                     pct_within_10_min, mean_actual_wait_minutes]
+          properties:
+            joined: { type: integer }
+            served: { type: integer }
+            no_shows: { type: integer }
+            left_queue: { type: integer }
+            via_app: { type: integer }
+            via_e_walk_in: { type: integer, description: Joined through E Walk-In }
+            mean_abs_error_minutes:
+              type: [number, 'null']
+              description: Average gap between the start time shown at join and the actual start (pilot target < 10)
+            mean_signed_error_minutes: { type: [number, 'null'], description: Positive = customers started later than promised }
+            pct_within_10_min: { type: [number, 'null'] }
+            mean_actual_wait_minutes: { type: [number, 'null'] }
+        by_stylist:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [stylist_id, display_name, served, mean_abs_error_minutes, mean_overrun_minutes]
+            properties:
+              stylist_id: { type: string, format: uuid }
+              display_name: { type: string }
+              served: { type: integer }
+              mean_abs_error_minutes: { type: [number, 'null'] }
+              mean_overrun_minutes:
+                type: [number, 'null']
+                description: Actual minus booked service time; a hint to adjust that stylist's durations
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      operationId: health
+      summary: Liveness and database check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, time]
+                properties:
+                  ok: { type: boolean }
+                  time: { $ref: '#/components/schemas/Timestamp' }
+
+  # ------------------------------------------------------------------ auth
+  /v1/auth/otp/request:
+    post:
+      tags: [Auth]
+      operationId: requestOtp
+      summary: Send a 6-digit sign-in code (WhatsApp; printed to the server log in development)
+      description: |
+        Only the newest code for a number is valid. Limits: one request per 30 s
+        (OTP_RESEND_TOO_SOON with `details.retry_after_seconds`), 5 per hour (OTP_TOO_MANY_REQUESTS),
+        plus 10 requests per minute per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string, description: 'Indian mobile, any common format', example: '98765 43210' }
+      responses:
+        '200':
+          description: Code sent
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [phone, channel, expires_in_seconds, resend_after_seconds]
+                properties:
+                  phone: { type: string, description: Normalised E.164 number }
+                  channel: { type: string, examples: [whatsapp, dev] }
+                  expires_in_seconds: { type: integer }
+                  resend_after_seconds: { type: integer }
+                  demo_code:
+                    type: string
+                    description: |
+                      The code itself. Only present on a demo deployment (`DEMO_MODE=true`) while no real
+                      messaging provider is configured (`channel` is `dev`), so the website can show it.
+                      Never returned when a real provider sent the code.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooMany' }
+        '502':
+          description: The messaging provider failed (OTP_DELIVERY_FAILED)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/auth/otp/verify:
+    post:
+      tags: [Auth]
+      operationId: verifyOtp
+      summary: Exchange the code for a customer token (creates the customer on first sign-in)
+      description: "Errors: OTP_INVALID (400, `details.attempts_left`), OTP_EXPIRED (400), OTP_LOCKED (429 after 5 wrong tries)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone: { type: string }
+                code: { type: string, pattern: '^\d{6}$' }
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [token, is_new, customer]
+                properties:
+                  token: { type: string }
+                  is_new: { type: boolean }
+                  customer: { $ref: '#/components/schemas/Customer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooMany' }
+
+  /v1/me:
+    get:
+      tags: [Auth]
+      operationId: getMe
+      security: [{ customerAuth: [] }]
+      responses:
+        '200':
+          description: The signed-in customer
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [customer]
+                properties:
+                  customer: { $ref: '#/components/schemas/Customer' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Auth]
+      operationId: updateMe
+      summary: Set the customer's name (asked once, after first sign-in)
+      security: [{ customerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [customer]
+                properties:
+                  customer: { $ref: '#/components/schemas/Customer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/staff/auth/login:
+    post:
+      tags: [Auth]
+      operationId: staffLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Signed in. Use memberships to route to /dashboard/{salon_slug}.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/StaffProfile'
+                  - type: object
+                    required: [token]
+                    properties:
+                      token: { type: string }
+                unevaluatedProperties: false
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooMany' }
+
+  /v1/staff/me:
+    get:
+      tags: [Auth]
+      operationId: staffMe
+      security: [{ staffAuth: [] }]
+      responses:
+        '200':
+          description: The signed-in staff user and their salons
+          content:
+            application/json:
+              schema:
+                allOf: [{ $ref: '#/components/schemas/StaffProfile' }]
+                unevaluatedProperties: false
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ------------------------------------------------------------------ salons (public)
+  /v1/salons:
+    get:
+      tags: [Salons]
+      operationId: listSalons
+      summary: Nearest salons (with lat/lng) or all salons by name (location denied)
+      description: With exactly one salon returned, the app can skip the chooser.
+      parameters:
+        - { name: lat, in: query, schema: { type: number } }
+        - { name: lng, in: query, schema: { type: number } }
+        - { name: radius_m, in: query, schema: { type: integer, minimum: 100, maximum: 100000 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: Salons, nearest first when a location is given
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [salons]
+                properties:
+                  salons: { type: array, items: { $ref: '#/components/schemas/SalonSummary' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/salons/{slug}:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Salons]
+      operationId: getSalon
+      responses:
+        '200':
+          description: Salon with opening hours and live open/closed status
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [salon]
+                properties:
+                  salon: { $ref: '#/components/schemas/SalonDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/salons/{slug}/services:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Salons]
+      operationId: listServices
+      responses:
+        '200':
+          description: Active services in menu order
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [services]
+                properties:
+                  services: { type: array, items: { $ref: '#/components/schemas/Service' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/salons/{slug}/stylists:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Salons]
+      operationId: listStylistsWithWaits
+      summary: Stylist cards with each stylist's own wait for the chosen services
+      description: |
+        With `service_ids`, only stylists who do *all* of them are returned, each with their own
+        duration and estimated start, plus `any_available` (the shortest wait) and `e_walk_in`
+        (what E Walk-In would give right now: stylists free, or the countdown to the next slot).
+        Stylists who are off are listed with `available: false`.
+      parameters:
+        - name: service_ids
+          in: query
+          description: Comma-separated service ids
+          schema: { type: string }
+      responses:
+        '200':
+          description: Stylist cards
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OpenStatus'
+                  - type: object
+                    required: [stylists, any_available, e_walk_in]
+                    properties:
+                      stylists: { type: array, items: { $ref: '#/components/schemas/StylistCard' } }
+                      any_available:
+                        oneOf: [{ $ref: '#/components/schemas/AnyAvailable' }, { type: 'null' }]
+                      e_walk_in: { $ref: '#/components/schemas/EWalkInStatus' }
+                unevaluatedProperties: false
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/salons/{slug}/events:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Salons]
+      operationId: salonEvents
+      summary: Live updates (Server-Sent Events)
+      description: |
+        Sends one `queue` event immediately, then one after every queue change and at least every
+        30 s while anyone is waiting (estimates move with the clock). `data` is a
+        PublicSnapshot. On each event, refetch `GET /v1/queue/{entryId}` (customer) or
+        `GET /v1/dashboard/{slug}` (desk). A `: ping` comment is sent every 25 s.
+      responses:
+        '200':
+          description: 'text/event-stream of `event: queue` messages whose data is a PublicSnapshot'
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/PublicSnapshot' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ customer queue
+  /v1/salons/{slug}/queue:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    post:
+      tags: [Queue]
+      operationId: joinQueue
+      summary: Join the queue
+      description: |
+        Error codes: NAME_REQUIRED, NO_SERVICES, INVALID_SERVICES, STYLIST_DOES_NOT_OFFER (400);
+        TOO_FAR_FROM_SALON (403, when `location` is sent and is beyond the salon's radius);
+        ALREADY_IN_QUEUE (`details.entry_id`), JOINS_PAUSED, SALON_CLOSED (`details.next_open_at`),
+        STYLIST_UNAVAILABLE, NO_STYLIST_AVAILABLE, WOULD_EXCEED_CLOSING (409).
+
+        **E Walk-In** (`e_walk_in: true`): with no `stylist_id`, a stylist is picked at random from those
+        taking part in E Walk-In who can start soonest (any free stylist, otherwise whoever frees up first).
+        With a `stylist_id`, that stylist is requested by name. Extra 409 codes: E_WALK_IN_DISABLED (the desk
+        switched it off), STYLIST_NOT_E_WALK_IN (that stylist is not taking E Walk-In clients).
+        The returned entry has `e_walk_in: true`, `people_ahead` and `est_start_at` for the countdown.
+      security: [{ customerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [service_ids]
+              properties:
+                service_ids: { type: array, minItems: 1, maxItems: 10, items: { type: string, format: uuid } }
+                stylist_id: { type: [string, 'null'], format: uuid, description: Omit or null for "any available" (with e_walk_in, a random stylist) }
+                e_walk_in: { type: boolean, default: false, description: Join through E Walk-In }
+                location:
+                  type: [object, 'null']
+                  description: Browser location, used to refuse joins from far away. Omit if permission was denied.
+                  required: [lat, lng]
+                  properties:
+                    lat: { type: number }
+                    lng: { type: number }
+      responses:
+        '201':
+          description: Joined
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [entry]
+                properties:
+                  entry: { $ref: '#/components/schemas/CustomerQueueEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/me/queue:
+    get:
+      tags: [Queue]
+      operationId: myActiveEntries
+      summary: The customer's active place(s) in a queue (use on app start to resume)
+      security: [{ customerAuth: [] }]
+      responses:
+        '200':
+          description: Active entries; empty when not in a queue
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [entries]
+                properties:
+                  entries: { type: array, items: { $ref: '#/components/schemas/CustomerQueueEntry' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/queue/{entryId}:
+    parameters: [{ $ref: '#/components/parameters/EntryId' }]
+    get:
+      tags: [Queue]
+      operationId: getMyEntry
+      summary: Queue status screen (live position and estimate)
+      security: [{ customerAuth: [] }]
+      responses:
+        '200':
+          description: The entry. Ended entries (done, left, ...) have null estimates.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [entry]
+                properties:
+                  entry: { $ref: '#/components/schemas/CustomerQueueEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/queue/{entryId}/leave:
+    parameters: [{ $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Queue]
+      operationId: leaveQueue
+      summary: Leave the queue (allowed while waiting or called; CANNOT_LEAVE once in service)
+      security: [{ customerAuth: [] }]
+      responses:
+        '200':
+          description: Left
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [entry]
+                properties:
+                  entry: { $ref: '#/components/schemas/CustomerQueueEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ------------------------------------------------------------------ dashboard
+  /v1/dashboard/{slug}:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Dashboard]
+      operationId: getDashboard
+      summary: "Everything the front-desk screen shows (roles: all)"
+      security: [{ staffAuth: [] }]
+      responses:
+        '200':
+          description: Live queue and stylist board
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/dashboard/{slug}/walk-ins:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    post:
+      tags: [Dashboard]
+      operationId: addWalkIn
+      summary: Add a customer without the app (owner, receptionist)
+      description: |
+        Walk-ins skip the opening-hours, paused and closing-time checks (the desk decides).
+        With a phone number the customer is linked to (or creates) their profile and gets WhatsApp alerts.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, service_ids]
+              properties:
+                name: { type: string }
+                phone: { type: [string, 'null'] }
+                service_ids: { type: array, minItems: 1, items: { type: string, format: uuid } }
+                stylist_id: { type: [string, 'null'], format: uuid }
+      responses:
+        '201':
+          description: Added
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [entry]
+                properties:
+                  entry: { $ref: '#/components/schemas/DashboardQueueEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    patch:
+      tags: [Dashboard]
+      operationId: moveEntry
+      summary: Reassign to another stylist and/or reorder (owner, receptionist)
+      description: "`position` is 1-based within the stylist's line (1 = next). Reassigning without a position puts them at the back."
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                stylist_id: { type: string, format: uuid }
+                position: { type: integer, minimum: 1 }
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}/call:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Dashboard]
+      operationId: callEntry
+      summary: Call a waiting customer to the chair (sends WhatsApp; starts the no-show grace timer)
+      description: One called customer per stylist at a time (STYLIST_ALREADY_CALLING). Stylists may only call their own customers.
+      security: [{ staffAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}/start:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Dashboard]
+      operationId: startEntry
+      summary: Mark in service (stylist becomes busy; STYLIST_BUSY if already serving someone)
+      security: [{ staffAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}/finish:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Dashboard]
+      operationId: finishEntry
+      summary: Mark done (stylist becomes available)
+      security: [{ staffAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}/extend:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Dashboard]
+      operationId: extendEntry
+      summary: Add time to a running service (+5 / +10 buttons); pushes everyone behind back
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [minutes]
+              properties:
+                minutes: { type: integer, minimum: 1, maximum: 120, examples: [5, 10] }
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}/no-show:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Dashboard]
+      operationId: markNoShow
+      summary: Mark a waiting or called customer as no-show (owner, receptionist)
+      security: [{ staffAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}/requeue:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Dashboard]
+      operationId: requeueEntry
+      summary: Skip - move to the back of the stylist's line (owner, receptionist)
+      security: [{ staffAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/queue/{entryId}/cancel:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/EntryId' }]
+    post:
+      tags: [Dashboard]
+      operationId: cancelEntry
+      summary: Remove from the queue (owner, receptionist)
+      security: [{ staffAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/DashboardEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/stylists:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Dashboard settings]
+      operationId: listStylistsAdmin
+      summary: All stylists (including inactive) with services and duration overrides
+      security: [{ staffAuth: [] }]
+      responses:
+        '200':
+          description: Stylists
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [stylists]
+                properties:
+                  stylists: { type: array, items: { $ref: '#/components/schemas/StylistAdmin' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Dashboard settings]
+      operationId: createStylist
+      summary: Add a stylist (owner). Starts with status off.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name: { type: string }
+                service_ids: { type: array, items: { type: string, format: uuid } }
+                sort_order: { type: integer }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [stylist]
+                properties:
+                  stylist:
+                    type: object
+                    additionalProperties: false
+                    required: [id, display_name, status]
+                    properties:
+                      id: { type: string, format: uuid }
+                      display_name: { type: string }
+                      status: { $ref: '#/components/schemas/StylistStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/dashboard/{slug}/stylists/{stylistId}:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/StylistId' }]
+    patch:
+      tags: [Dashboard settings]
+      operationId: updateStylist
+      summary: Rename, reorder or deactivate (owner). STYLIST_HAS_QUEUE if deactivating with customers waiting.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                sort_order: { type: integer }
+                is_active: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok]
+                properties: { ok: { type: boolean } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/stylists/{stylistId}/status:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/StylistId' }]
+    put:
+      tags: [Dashboard]
+      operationId: setStylistStatus
+      summary: One-tap stylist status (all roles; stylists only their own)
+      description: |
+        `break` lasts `break_minutes` (default 15); estimates start after it.
+        `off` moves their "any available" customers to whoever can take them soonest;
+        customers who asked for this stylist stay and show `stylist_available: false`.
+        Refused with STYLIST_HAS_ACTIVE_SERVICE while they have someone in the chair.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/StylistStatus' }
+                break_minutes: { type: integer, minimum: 1, maximum: 240 }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [stylist]
+                properties:
+                  stylist: { $ref: '#/components/schemas/StylistBoardItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/stylists/{stylistId}/e-walk-in:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/StylistId' }]
+    put:
+      tags: [Dashboard]
+      operationId: setStylistEWalkIn
+      summary: Switch one stylist in or out of E Walk-In (desk can change anyone, stylists only themselves)
+      description: |
+        Off = out of the random pool and not requestable by name through E Walk-In. Customers already in
+        that stylist's line stay where they are. The desk can still add walk-ins for them.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [stylist]
+                properties:
+                  stylist: { $ref: '#/components/schemas/StylistBoardItem' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/dashboard/{slug}/stylists/{stylistId}/services:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/StylistId' }]
+    put:
+      tags: [Dashboard settings]
+      operationId: setStylistServices
+      summary: Replace which services this stylist offers and their own durations (owner)
+      description: Waiting customers' durations are updated immediately; agreed prices are not.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [services]
+              properties:
+                services:
+                  type: array
+                  items:
+                    type: object
+                    required: [service_id]
+                    properties:
+                      service_id: { type: string, format: uuid }
+                      custom_minutes: { type: [integer, 'null'], minimum: 1, maximum: 600, description: null = use the service default }
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok]
+                properties: { ok: { type: boolean } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/dashboard/{slug}/services:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Dashboard settings]
+      operationId: listServicesAdmin
+      summary: Full service menu including hidden services
+      security: [{ staffAuth: [] }]
+      responses:
+        '200':
+          description: Services
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [services]
+                properties:
+                  services: { type: array, items: { $ref: '#/components/schemas/ServiceAdmin' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Dashboard settings]
+      operationId: createService
+      summary: Add a service (owner). Offered by all active stylists unless stylist_ids is given.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, price_paise, default_minutes]
+              properties:
+                name: { type: string }
+                description: { type: [string, 'null'] }
+                price_paise: { type: integer, minimum: 0 }
+                default_minutes: { type: integer, minimum: 1, maximum: 600 }
+                sort_order: { type: integer }
+                is_active: { type: boolean }
+                stylist_ids: { type: array, items: { type: string, format: uuid } }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [service]
+                properties:
+                  service: { $ref: '#/components/schemas/ServiceAdmin' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/dashboard/{slug}/services/{serviceId}:
+    parameters: [{ $ref: '#/components/parameters/Slug' }, { $ref: '#/components/parameters/ServiceId' }]
+    patch:
+      tags: [Dashboard settings]
+      operationId: updateService
+      summary: Edit or hide a service (owner). `is_active=false` hides it from the menu.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: [string, 'null'] }
+                price_paise: { type: integer, minimum: 0 }
+                default_minutes: { type: integer, minimum: 1, maximum: 600 }
+                sort_order: { type: integer }
+                is_active: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [service]
+                properties:
+                  service: { $ref: '#/components/schemas/ServiceAdmin' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/dashboard/{slug}/settings:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Dashboard settings]
+      operationId: getSettings
+      security: [{ staffAuth: [] }]
+      responses:
+        '200':
+          description: Salon settings
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [settings]
+                properties:
+                  settings: { $ref: '#/components/schemas/SalonSettings' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    patch:
+      tags: [Dashboard settings]
+      operationId: updateSettings
+      summary: Change settings (owner) or pause/resume joins (owner, receptionist)
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettingsPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [settings]
+                properties:
+                  settings: { $ref: '#/components/schemas/SalonSettings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/dashboard/{slug}/hours:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Dashboard settings]
+      operationId: getHours
+      security: [{ staffAuth: [] }]
+      responses:
+        '200':
+          description: Weekly hours and upcoming holidays
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [timezone, hours, holidays]
+                properties:
+                  timezone: { type: string }
+                  hours: { type: array, items: { $ref: '#/components/schemas/HoursInterval' } }
+                  holidays:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [date, note]
+                      properties:
+                        date: { type: string, format: date }
+                        note: { type: [string, 'null'] }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Dashboard settings]
+      operationId: setHours
+      summary: Replace the weekly schedule (owner)
+      description: Several intervals on the same weekday model a midday break (e.g. 10:00-14:00 and 15:00-21:00). A day with no intervals is closed.
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hours]
+              properties:
+                hours: { type: array, items: { $ref: '#/components/schemas/HoursInterval' } }
+      responses:
+        '200':
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [hours]
+                properties:
+                  hours: { type: array, items: { $ref: '#/components/schemas/HoursInterval' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/dashboard/{slug}/holidays:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    post:
+      tags: [Dashboard settings]
+      operationId: addHoliday
+      summary: Close for a day (owner)
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [date]
+              properties:
+                date: { type: string, format: date }
+                note: { type: [string, 'null'] }
+      responses:
+        '201':
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [holiday]
+                properties:
+                  holiday:
+                    type: object
+                    additionalProperties: false
+                    required: [date, note]
+                    properties:
+                      date: { type: string, format: date }
+                      note: { type: [string, 'null'] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/dashboard/{slug}/holidays/{date}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - { name: date, in: path, required: true, schema: { type: string, format: date } }
+    delete:
+      tags: [Dashboard settings]
+      operationId: removeHoliday
+      security: [{ staffAuth: [] }]
+      responses:
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok]
+                properties: { ok: { type: boolean } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/dashboard/{slug}/reports/accuracy:
+    parameters: [{ $ref: '#/components/parameters/Slug' }]
+    get:
+      tags: [Dashboard]
+      operationId: accuracyReport
+      summary: Daily estimate accuracy (the pilot gate) (owner, receptionist)
+      security: [{ staffAuth: [] }]
+      parameters:
+        - { name: date, in: query, description: Salon-local date; default today, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Report
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccuracyReport' }
+        '403': { $ref: '#/components/responses/Forbidden' }

@@ -1304,6 +1304,12 @@ export interface operations {
                         channel: string;
                         expires_in_seconds: number;
                         resend_after_seconds: number;
+                        /**
+                         * @description The code itself. Only present on a demo deployment (`DEMO_MODE=true`) while no real
+                         *     messaging provider is configured (`channel` is `dev`), so the website can show it.
+                         *     Never returned when a real provider sent the code.
+                         */
+                        demo_code?: string;
                     };
                 };
             };

@@ -10,6 +10,8 @@ import { customerSession } from '@/lib/session';
 interface OtpRequested {
   phone: string;
   channel: string;
+  /** Demo deployments only: the code itself, because nothing is sent to WhatsApp. */
+  demo_code?: string;
   expires_in_seconds: number;
   resend_after_seconds: number;
 }
@@ -76,6 +78,7 @@ function Login() {
         <CodeStep
           phone={sent?.phone ?? '+91 ' + digits}
           channel={sent?.channel}
+          demoCode={sent?.demo_code}
           busy={busy}
           error={error}
           resendAt={resendAt}
@@ -126,6 +129,7 @@ function Login() {
 function CodeStep({
   phone,
   channel,
+  demoCode,
   busy,
   error,
   resendAt,
@@ -134,6 +138,7 @@ function CodeStep({
 }: {
   phone: string;
   channel?: string;
+  demoCode?: string;
   busy: boolean;
   error: ApiError | null;
   resendAt: number;
@@ -161,13 +166,41 @@ function CodeStep({
 
   return (
     <div className="pt-2">
-      <p className="text-muted">
-        We sent a code to <span className="font-semibold text-ink">{phone}</span> on WhatsApp.
-      </p>
-      {channel === 'dev' && (
-        <Notice tone="warn" className="mt-3">
-          Development mode: the code is printed in the backend terminal.
-        </Notice>
+      {demoCode ? (
+        <>
+          <p className="text-muted">
+            Demo mode: no WhatsApp message is sent to <span className="font-semibold text-ink">{phone}</span>.
+          </p>
+          <Notice tone="warn" title="Your sign-in code" className="mt-3">
+            <div className="flex items-center justify-between gap-3">
+              <span data-testid="demo-code" className="tabular text-3xl font-bold tracking-[0.3em]">
+                {demoCode}
+              </span>
+              <Button
+                type="button"
+                variant="secondary"
+                disabled={busy || locked}
+                onClick={() => {
+                  setCode(demoCode);
+                  onVerify(demoCode);
+                }}
+              >
+                Use code
+              </Button>
+            </div>
+          </Notice>
+        </>
+      ) : (
+        <>
+          <p className="text-muted">
+            We sent a code to <span className="font-semibold text-ink">{phone}</span> on WhatsApp.
+          </p>
+          {channel === 'dev' && (
+            <Notice tone="warn" className="mt-3">
+              Development mode: the code is printed in the backend terminal.
+            </Notice>
+          )}
+        </>
       )}
       <form
         className="mt-6 space-y-4"

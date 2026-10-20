@@ -51,4 +51,4 @@ npm run dev                 # then open http://localhost:3001
 
 ## Before putting it online
 
-See the "Deployment notes" in `Backend/README.md`. In short: the API needs an always-on host (Railway, Render, Fly), the database needs PostGIS (Supabase or Neon), the website can go on Vercel, and WhatsApp needs the three Meta-approved templates through Vobiz.
+To host the demo on Render (API + database) and Vercel (website), follow [`DEPLOY.md`](DEPLOY.md). For real customers, see the "Deployment notes" in `Backend/README.md`. In short: the API needs an always-on host (Railway, Render, Fly), the database needs PostGIS (Supabase or Neon), the website can go on Vercel, and WhatsApp needs the three Meta-approved templates through Vobiz.
