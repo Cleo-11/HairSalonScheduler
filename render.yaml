@@ -3,6 +3,7 @@
 databases:
   - name: kataar-db
     plan: free # free databases are deleted 30 days after creation; upgrade to keep the data
+    region: singapore # must match the API's region, or the API cannot reach the database
     databaseName: kataar
     user: kataar
     postgresMajorVersion: "16"

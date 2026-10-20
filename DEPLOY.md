@@ -63,3 +63,7 @@ In Render -> `kataar-api` -> **Environment**, change `CORS_ORIGINS` from `*` to 
 2. Remove `DEMO_MODE` and `SEED_STAFF_PASSWORD`. The API then refuses to start with the dev provider, which is the safety net.
 3. Create the real salon and staff accounts and delete the demo logins.
 4. Move the database off the free plan and set `CORS_ORIGINS` to your real domain.
+
+## If the deploy fails
+
+- **`getaddrinfo ENOTFOUND dpg-...`** in the API's logs: the database and the API are in different Render regions, so the API cannot find the database. Both must use the same region (`render.yaml` sets `singapore` for both). A region cannot be changed after creation: delete the database and the API in Render (Dashboard -> the service -> Settings -> Delete), then create the Blueprint again.
