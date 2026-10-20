@@ -1,0 +1,9 @@
+{
+  "name": "Kataar · Salon queue",
+  "short_name": "Kataar",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#faf7f2",
+  "theme_color": "#0e5e58",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
